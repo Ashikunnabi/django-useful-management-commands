@@ -1,0 +1,164 @@
+import csv
+import os
+from django.apps import apps
+from django.core.management.base import BaseCommand
+from django.db import models, transaction
+from django.utils import timezone
+from tabulate import tabulate
+
+class Command(BaseCommand):
+    help = "🚑 Scans and repairs broken foreign key relations across Django apps/models."
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '--apps', nargs='+', type=str, required=True,
+            help="List of Django app labels to scan (e.g., 'orders users')."
+        )
+        parser.add_argument(
+            '--models', nargs='*', type=str,
+            help="Optional list of specific models to scan (e.g., 'Order UserProfile')."
+        )
+        parser.add_argument(
+            '--batch-size', type=int, default=500,
+            help="Batch size for processing records."
+        )
+        parser.add_argument(
+            '--fix', action='store_true',
+            help="Attempt to fix broken relations."
+        )
+        parser.add_argument(
+            '--action', type=str, choices=['delete', 'nullify'], default='delete',
+            help="Fix strategy: delete or nullify broken records."
+        )
+        parser.add_argument(
+            '--default-id', type=int,
+            help="Set FK to a default object ID instead of nullifying (if provided)."
+        )
+        parser.add_argument(
+            '--report', type=str,
+            help="Path to save a CSV report of broken relations (e.g., './broken_relations.csv')."
+        )
+        parser.add_argument(
+            '--dry-run', action='store_true',
+            help="Simulate actions without changing any data."
+        )
+
+    def handle(self, *args, **options):
+        apps_labels = options['apps']
+        models_filter = options['models']
+        batch_size = options['batch_size']
+        fix = options['fix']
+        action = options['action']
+        default_id = options['default_id']
+        report_path = options['report']
+        dry_run = options['dry_run']
+
+        all_broken_links = []
+
+        for app_label in apps_labels:
+            app_config = apps.get_app_config(app_label)
+            models_in_app = app_config.get_models()
+
+            for model in models_in_app:
+                if models_filter and model.__name__ not in models_filter:
+                    continue
+
+                for field in model._meta.get_fields():
+                    if isinstance(field, models.ForeignKey):
+                        self.stdout.write(f"🔍 Checking {model.__name__}.{field.name} -> {field.related_model.__name__}")
+                        broken_rows = self.find_broken_fk(model, field)
+
+                        if broken_rows.exists():
+                            all_broken_links.append((model, field, broken_rows))
+
+        if not all_broken_links:
+            self.stdout.write(self.style.SUCCESS("✅ No broken relations found."))
+            return
+
+        if report_path:
+            self.generate_report(all_broken_links, report_path)
+            self.stdout.write(self.style.SUCCESS(f"📝 Report saved to {report_path}"))
+
+        for model, field, queryset in all_broken_links:
+            headers = ["ID", f"{field.name}_id"]
+            rows = queryset.values_list("id", f"{field.name}")
+            self.stdout.write(tabulate(rows, headers, tablefmt="psql"))
+
+            if fix and not dry_run:
+                self.fix_broken(model, field, queryset, action, default_id, batch_size)
+            elif fix and dry_run:
+                self.stdout.write(self.style.WARNING(f"⚠️  Dry-run: would have fixed {queryset.count()} records in {model.__name__}."))
+
+    def find_broken_fk(self, model, field):
+        """Find instances where FK is pointing to non-existent object."""
+        rel_model = field.related_model
+        fk_field_name = field.name
+        fk_id_field = f"{fk_field_name}_id"
+
+        existing_ids = set(rel_model.objects.values_list('id', flat=True))
+        queryset = model.objects.exclude(**{f"{fk_field_name}__isnull": True})
+
+        broken = queryset.exclude(**{fk_id_field + "__in": existing_ids})
+        return broken
+
+    def fix_broken(self, model, field, queryset, action, default_id, batch_size):
+        fk_field_name = field.name
+        total = queryset.count()
+        self.stdout.write(self.style.WARNING(f"⚙️  Fixing {total} broken records in {model.__name__}..."))
+
+        with transaction.atomic():
+            for batch_start in range(0, total, batch_size):
+                batch = queryset[batch_start:batch_start + batch_size]
+
+                if action == "delete":
+                    batch.delete()
+                elif action == "nullify":
+                    if not field.null:
+                        self.stdout.write(self.style.ERROR(
+                            f"Field {model.__name__}.{fk_field_name} is NOT NULL — cannot nullify."
+                        ))
+                        continue
+                    batch.update(**{fk_field_name: None})
+                elif default_id is not None:
+                    batch.update(**{fk_field_name + "_id": default_id})
+
+        self.stdout.write(self.style.SUCCESS(f"✅ Successfully fixed {total} records in {model.__name__}."))
+
+    def generate_report(self, broken_links, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        with open(path, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(["Model", "Field", "BrokenRecordID", "BrokenFKID"])
+
+            for model, field, queryset in broken_links:
+                for obj in queryset.values("id", f"{field.name}"):
+                    writer.writerow([
+                        model.__name__,
+                        field.name,
+                        obj["id"],
+                        obj[field.name]
+                    ])
+
+
+# Example Usage
+# ✅ Scan two apps
+# python manage.py repair_model_relations --apps orders users
+
+# ✅ Only scan specific models
+# python manage.py repair_model_relations --apps orders --models Order OrderItem
+
+# ✅ Fix broken FKs by deleting broken records
+# python manage.py repair_model_relations --apps orders --fix --action delete
+
+# ✅ Fix by nullifying broken FKs (if allowed)
+# python manage.py repair_model_relations --apps orders --fix --action nullify
+
+# ✅ Fix by setting a default ID
+# python manage.py repair_model_relations --apps orders --fix --default-id 1
+
+# ✅ Generate a CSV Report
+# python manage.py repair_model_relations --apps orders --report ./reports/broken_relations.csv
+
+# ✅ Safe Dry Run
+# python manage.py repair_model_relations --apps orders --fix --dry-run
